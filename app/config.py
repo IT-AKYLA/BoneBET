@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     METRIC_CALCULATION_INTERVAL_HOURS: int = 6
     SNAPSHOT_RETENTION_DAYS: int = 90
     
+    # Telegram Bot
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
+    
     @property
     def is_development(self) -> bool:
         return self.ENVIRONMENT == "development"

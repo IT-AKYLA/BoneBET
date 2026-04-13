@@ -17,7 +17,7 @@ class BetService:
     def __init__(self):
         self.client = CS2AnalyticsClient()
         self.cache = RedisCache(prefix="bonebet")
-        self.cache_ttl = 86400  # 24 часа
+        self.cache_ttl = 18000
         
     async def _get_team_ranking_ai(self, team_name: str) -> int:
         """Get team ranking from AI if not in top-50."""
