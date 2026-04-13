@@ -1,5 +1,3 @@
-"""Telegram bot for BoneBET."""
-
 import asyncio
 from typing import Dict, Any, List
 
@@ -26,22 +24,31 @@ class BoneBETBot:
         self.app.add_handler(CommandHandler("bet", self.bet_command))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = "🎲 *BoneBET*\n\n*/bet* — прогнозы на матчи\n*/bet 8* — 8 матчей"
+        text = (
+            "🎲 *BoneBET*\n\n"
+            "Прогнозы на CS2 матчи с AI анализом\n\n"
+            "*/bet* — все матчи\n"
+            "*/bet 5* — только топ-5\n"
+            "*/bet tier1* — элитный уровень"
+        )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     
     async def bet_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
-        limit = 5
+        limit = 20  # все матчи
+        tier_filter = "all"
         
         for arg in args:
             if arg.isdigit():
-                limit = min(int(arg), 10)
+                limit = int(arg)
+            elif arg.lower() == "tier1":
+                tier_filter = "tier1"
         
-        msg = await update.message.reply_text("🔍 Анализ...")
+        msg = await update.message.reply_text("🔍 BoneBET анализирует матчи...")
         
         try:
             matches = await self.bet_service.analyze_matches(
-                limit=limit, tier_filter="all", use_ai=False, force_refresh=False
+                limit=limit, tier_filter=tier_filter, use_ai=True, force_refresh=False
             )
             
             if not matches:
@@ -50,17 +57,26 @@ class BoneBETBot:
             
             await msg.delete()
             
-            # Отправляем всё одним сообщением
-            text = self._format_matches(matches)
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            # Группируем по турнирам
+            by_tournament = {}
+            for m in matches:
+                tour = m.get('tournament', 'Другие')
+                if tour not in by_tournament:
+                    by_tournament[tour] = []
+                by_tournament[tour].append(m)
+            
+            # Отправляем сгруппированные
+            for tour, tour_matches in by_tournament.items():
+                text = self._format_tournament_matches(tour, tour_matches)
+                await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
                 
         except Exception as e:
             logger.error(f"Bet error: {e}")
-            await msg.edit_text("❌ Ошибка")
+            await msg.edit_text("❌ Ошибка анализа. Попробуй позже")
     
-    def _format_matches(self, matches: List[Dict]) -> str:
-        """Краткий формат всех матчей."""
-        lines = ["🎲 *BoneBET — Прогнозы*\n"]
+    def _format_tournament_matches(self, tournament: str, matches: List[Dict]) -> str:
+        """Форматирование матчей турнира."""
+        lines = [f"🏆 *{tournament}*\n"]
         
         for m in matches:
             t1 = m['team1']['name']
@@ -69,14 +85,16 @@ class BoneBETBot:
             winner = p['winner']
             prob = p['team1_win_prob'] if winner == t1 else p['team2_win_prob']
             
-            # Только дата, команды и винрейт
-            time_str = m.get('scheduled_at', '—')
+            time_str = m.get('scheduled_at', 'LIVE') if m.get('status') != 'live' else '🔴 LIVE'
             if ':' in str(time_str):
-                time_str = time_str[:5]  # Только часы:минуты
+                time_str = time_str[:5]
+            
+            conf = p['confidence']
+            conf_icon = "🟢" if conf == "high" else "🟡" if conf == "medium" else ""
             
             lines.append(
-                f"🕐 {time_str}  *{t1}* vs *{t2}*\n"
-                f"   → {winner} ({prob:.0f}%)\n"
+                f"{time_str}  *{t1}* vs *{t2}*\n"
+                f"└ {winner} · {prob:.0f}% {conf_icon}\n"
             )
         
         return '\n'.join(lines)
