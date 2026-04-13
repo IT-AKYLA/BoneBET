@@ -22,27 +22,69 @@ class BoneBETBot:
         self.app = Application.builder().token(self.token).build()
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("bet", self.bet_command))
+        self.app.add_handler(CommandHandler("live", self.live_command))
+        self.app.add_handler(CommandHandler("refresh", self.refresh_command))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🎲 *BoneBET*\n\n"
             "Прогнозы на CS2 матчи с AI анализом\n\n"
             "*/bet* — все матчи\n"
-            "*/bet 5* — только топ-5\n"
+            "*/live* — только LIVE\n"
+            "*/refresh* — сбросить кэш\n"
+            "*/bet 5* — топ-5\n"
             "*/bet tier1* — элитный уровень"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     
+    async def refresh_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сбросить кэш и получить свежий анализ."""
+        msg = await update.message.reply_text("🔄 Сбрасываю кэш...")
+        
+        try:
+            deleted = await self.bet_service.invalidate_match_cache()
+            await msg.edit_text(f"✅ Кэш сброшен ({deleted} ключей)\nИспользуй /bet для свежего анализа")
+        except Exception as e:
+            logger.error(f"Refresh error: {e}")
+            await msg.edit_text("❌ Ошибка сброса кэша")
+    
+    async def live_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Только LIVE матчи."""
+        msg = await update.message.reply_text("🔴 BoneBET ищет LIVE матчи...")
+        
+        try:
+            matches = await self.bet_service.analyze_matches(
+                limit=20, tier_filter="all", use_ai=True, force_refresh=False
+            )
+            
+            live_matches = [m for m in matches if m.get('status') == 'live']
+            
+            if not live_matches:
+                await msg.edit_text("🔴 Нет LIVE матчей")
+                return
+            
+            await msg.delete()
+            
+            text = self._format_live_matches(live_matches)
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+                
+        except Exception as e:
+            logger.error(f"Live error: {e}")
+            await msg.edit_text("❌ Ошибка")
+    
     async def bet_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
-        limit = 20  # все матчи
+        limit = 20
         tier_filter = "all"
+        live_only = False
         
         for arg in args:
             if arg.isdigit():
                 limit = int(arg)
             elif arg.lower() == "tier1":
                 tier_filter = "tier1"
+            elif arg.lower() == "live":
+                live_only = True
         
         msg = await update.message.reply_text("🔍 BoneBET анализирует матчи...")
         
@@ -50,6 +92,9 @@ class BoneBETBot:
             matches = await self.bet_service.analyze_matches(
                 limit=limit, tier_filter=tier_filter, use_ai=True, force_refresh=False
             )
+            
+            if live_only:
+                matches = [m for m in matches if m.get('status') == 'live']
             
             if not matches:
                 await msg.edit_text("❌ Матчи не найдены")
@@ -65,7 +110,6 @@ class BoneBETBot:
                     by_tournament[tour] = []
                 by_tournament[tour].append(m)
             
-            # Отправляем сгруппированные
             for tour, tour_matches in by_tournament.items():
                 text = self._format_tournament_matches(tour, tour_matches)
                 await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -73,6 +117,54 @@ class BoneBETBot:
         except Exception as e:
             logger.error(f"Bet error: {e}")
             await msg.edit_text("❌ Ошибка анализа. Попробуй позже")
+    
+    def _extract_key_factor(self, ai_text: str) -> str:
+        """Extract key factor from AI analysis in English."""
+        if not ai_text:
+            return ""
+        
+        lines = ai_text.split('\n')
+        
+        for i, line in enumerate(lines):
+            lower = line.lower()
+            if 'key factor' in lower or 'ключевой фактор' in lower or '📋' in line:
+                factor = line.replace('📋', '').replace('Key factor:', '').replace('Ключевой фактор:', '').strip()
+                if factor:
+                    return factor[:50]
+                if i + 1 < len(lines):
+                    return lines[i+1][:50]
+        
+        for line in lines:
+            if 'because' in line.lower() or 'due to' in line.lower():
+                return line[:50]
+        
+        return ""
+    
+    def _format_live_matches(self, matches: List[Dict]) -> str:
+        """Форматирование LIVE матчей."""
+        lines = ["🔴 *BoneBET — LIVE Матчи*\n"]
+        
+        for m in matches:
+            t1 = m['team1']['name']
+            t2 = m['team2']['name']
+            p = m['prediction']
+            winner = p['winner']
+            prob = p['team1_win_prob'] if winner == t1 else p['team2_win_prob']
+            tour = m.get('tournament', '—')
+            conf = p['confidence']
+            conf_icon = "🟢" if conf == "high" else "🟡" if conf == "medium" else ""
+            
+            ai = m.get('ai_analysis', {}).get('text', '')
+            key_factor = self._extract_key_factor(ai)
+            
+            lines.append(
+                f"🏆 {tour}\n"
+                f"*{t1}* vs *{t2}*\n"
+                f"└ {winner} · {prob:.0f}% {conf_icon}\n"
+                f"   {key_factor}\n"
+            )
+        
+        return '\n'.join(lines)
     
     def _format_tournament_matches(self, tournament: str, matches: List[Dict]) -> str:
         """Форматирование матчей турнира."""
@@ -85,16 +177,24 @@ class BoneBETBot:
             winner = p['winner']
             prob = p['team1_win_prob'] if winner == t1 else p['team2_win_prob']
             
-            time_str = m.get('scheduled_at', 'LIVE') if m.get('status') != 'live' else '🔴 LIVE'
-            if ':' in str(time_str):
-                time_str = time_str[:5]
+            status = m.get('status', '')
+            if status == 'live':
+                time_str = '🔴 LIVE'
+            else:
+                time_str = m.get('scheduled_at', '—')
+                if ':' in str(time_str):
+                    time_str = time_str[:5]
             
             conf = p['confidence']
             conf_icon = "🟢" if conf == "high" else "🟡" if conf == "medium" else ""
             
+            ai = m.get('ai_analysis', {}).get('text', '')
+            key_factor = self._extract_key_factor(ai)
+            
             lines.append(
                 f"{time_str}  *{t1}* vs *{t2}*\n"
                 f"└ {winner} · {prob:.0f}% {conf_icon}\n"
+                f"   {key_factor}\n"
             )
         
         return '\n'.join(lines)

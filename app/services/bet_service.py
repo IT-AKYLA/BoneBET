@@ -19,8 +19,9 @@ class BetService:
     def __init__(self):
         self.client = CS2AnalyticsClient()
         self.cache = RedisCache(prefix="bonebet")
-        self.cache_ttl = 18000  # 5 часов
-        self.ai_request_delay = 3  # секунды между AI-запросами
+        self.cache_ttl = 300  
+        self.long_cache_ttl = 86400  
+        self.ai_request_delay = 3
 
     async def analyze_matches(
         self,
@@ -29,12 +30,6 @@ class BetService:
         use_ai: bool = True,
         force_refresh: bool = False,
     ) -> List[Dict[str, Any]]:
-        """
-        Analyze live and upcoming matches with caching.
-        
-        Cache key: bonebet:matches:{tier_filter}:{limit}:{use_ai}
-        TTL: 5 hours
-        """
         cache_key = f"matches:{tier_filter}:{limit}:{use_ai}"
         
         if not force_refresh:
@@ -55,6 +50,16 @@ class BetService:
             logger.info(f"Cached {len(results)} matches with key {cache_key}")
         
         return results
+    
+    async def invalidate_match_cache(self, tier_filter: str = "all") -> int:
+        """Invalidate match cache."""
+        patterns = [f"matches:{tier_filter}:*"]
+        deleted = 0
+        for pattern in patterns:
+            count = await self.cache.delete_pattern(pattern)
+            deleted += count
+            logger.info(f"Deleted {count} keys for pattern {pattern}")
+        return deleted
     
     async def invalidate_cache(self, tier_filter: str = "all") -> None:
         """Invalidate cache for specific tier filter."""
@@ -343,7 +348,7 @@ class BetService:
         
         try:
             data = await self.client.get_live_matches()
-            await self.cache.set(cache_key, json.dumps(data), ttl=300)
+            await self.cache.set(cache_key, json.dumps(data), ttl=60)
             return data
         except Exception as e:
             logger.error(f"Failed to fetch live matches: {e}")
@@ -360,7 +365,7 @@ class BetService:
         
         try:
             data = await self.client.get_upcoming_matches()
-            await self.cache.set(cache_key, json.dumps(data), ttl=3600)
+            await self.cache.set(cache_key, json.dumps(data), ttl=300)  
             return data
         except Exception as e:
             logger.error(f"Failed to fetch upcoming matches: {e}")
@@ -377,7 +382,7 @@ class BetService:
         
         data = await self._get_team_data_safe(team_id, team_name)
         if data.get("id") != 0:
-            await self.cache.set(cache_key, json.dumps(data), ttl=86400)
+            await self.cache.set(cache_key, json.dumps(data), ttl=self.long_cache_ttl)
         return data
     
     async def _get_team_data_safe(self, team_id: Optional[int], team_name: str) -> Dict[str, Any]:
@@ -414,7 +419,7 @@ class BetService:
             if teams:
                 team_id = teams[0].get("id")
                 if team_id:
-                    await self.cache.set(cache_key, str(team_id), ttl=86400)
+                    await self.cache.set(cache_key, str(team_id), ttl=self.long_cache_ttl)                    
                     return team_id
         except Exception:
             pass
@@ -457,7 +462,7 @@ class BetService:
                 "faceit_elo": faceit.get("elo") if faceit else None,
             }
             
-            await self.cache.set(cache_key, json.dumps(data), ttl=86400)
+            await self.cache.set(cache_key, json.dumps(data), ttl=self.long_cache_ttl)
             return data
         except Exception as e:
             logger.warning(f"Failed to get player {nickname}: {e}")
