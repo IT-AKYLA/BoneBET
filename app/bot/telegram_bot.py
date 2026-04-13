@@ -49,28 +49,30 @@ class BoneBETBot:
             await msg.edit_text("❌ Ошибка сброса кэша")
     
     async def live_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Только LIVE матчи."""
         msg = await update.message.reply_text("🔴 BoneBET ищет LIVE матчи...")
-        
+
         try:
             matches = await self.bet_service.analyze_matches(
                 limit=20, tier_filter="all", use_ai=True, force_refresh=False
             )
-            
+
             live_matches = [m for m in matches if m.get('status') == 'live']
-            
+
             if not live_matches:
                 await msg.edit_text("🔴 Нет LIVE матчей")
                 return
-            
+
             await msg.delete()
-            
+
             text = self._format_live_matches(live_matches)
             await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-                
+
         except Exception as e:
             logger.error(f"Live error: {e}")
-            await msg.edit_text("❌ Ошибка")
+            try:
+                await msg.edit_text("❌ Ошибка")
+            except:
+                pass
     
     async def bet_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
@@ -118,32 +120,10 @@ class BoneBETBot:
             logger.error(f"Bet error: {e}")
             await msg.edit_text("❌ Ошибка анализа. Попробуй позже")
     
-    def _extract_key_factor(self, ai_text: str) -> str:
-        """Extract key factor from AI analysis in English."""
-        if not ai_text:
-            return ""
-        
-        lines = ai_text.split('\n')
-        
-        for i, line in enumerate(lines):
-            lower = line.lower()
-            if 'key factor' in lower or 'ключевой фактор' in lower or '📋' in line:
-                factor = line.replace('📋', '').replace('Key factor:', '').replace('Ключевой фактор:', '').strip()
-                if factor:
-                    return factor[:50]
-                if i + 1 < len(lines):
-                    return lines[i+1][:50]
-        
-        for line in lines:
-            if 'because' in line.lower() or 'due to' in line.lower():
-                return line[:50]
-        
-        return ""
-    
     def _format_live_matches(self, matches: List[Dict]) -> str:
         """Форматирование LIVE матчей."""
         lines = ["🔴 *BoneBET — LIVE Матчи*\n"]
-        
+
         for m in matches:
             t1 = m['team1']['name']
             t2 = m['team2']['name']
@@ -153,30 +133,26 @@ class BoneBETBot:
             tour = m.get('tournament', '—')
             conf = p['confidence']
             conf_icon = "🟢" if conf == "high" else "🟡" if conf == "medium" else ""
-            
-            ai = m.get('ai_analysis', {}).get('text', '')
-            key_factor = self._extract_key_factor(ai)
-            
+
             lines.append(
                 f"🏆 {tour}\n"
                 f"*{t1}* vs *{t2}*\n"
                 f"└ {winner} · {prob:.0f}% {conf_icon}\n"
-                f"   {key_factor}\n"
             )
-        
+
         return '\n'.join(lines)
     
     def _format_tournament_matches(self, tournament: str, matches: List[Dict]) -> str:
         """Форматирование матчей турнира."""
         lines = [f"🏆 *{tournament}*\n"]
-        
+
         for m in matches:
             t1 = m['team1']['name']
             t2 = m['team2']['name']
             p = m['prediction']
             winner = p['winner']
             prob = p['team1_win_prob'] if winner == t1 else p['team2_win_prob']
-            
+
             status = m.get('status', '')
             if status == 'live':
                 time_str = '🔴 LIVE'
@@ -184,19 +160,15 @@ class BoneBETBot:
                 time_str = m.get('scheduled_at', '—')
                 if ':' in str(time_str):
                     time_str = time_str[:5]
-            
+
             conf = p['confidence']
             conf_icon = "🟢" if conf == "high" else "🟡" if conf == "medium" else ""
-            
-            ai = m.get('ai_analysis', {}).get('text', '')
-            key_factor = self._extract_key_factor(ai)
-            
+
             lines.append(
                 f"{time_str}  *{t1}* vs *{t2}*\n"
                 f"└ {winner} · {prob:.0f}% {conf_icon}\n"
-                f"   {key_factor}\n"
             )
-        
+
         return '\n'.join(lines)
     
     async def start(self):

@@ -1,6 +1,6 @@
 """Prompt templates for AI analysis."""
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 
 
 class PromptTemplates:
@@ -26,28 +26,20 @@ class PromptTemplates:
         
         prompt = f"""Ты — профессиональный CS2 аналитик. Твоя задача — дать экспертный прогноз, жёстко привязанный к контексту силы соперников.
 
-## ПРАВИЛА АНАЛИЗА (ОБЯЗАТЕЛЬНЫ К ИСПОЛНЕНИЮ)
+## ПРАВИЛА АНАЛИЗА
 
-1. **Каждая цифра должна оцениваться относительно оппозиции.**
-   - True Win Rate 80% против команд #50+ ≠ True Win Rate 60% против топ-10.
-   - Firepower 7.0 против тир-3 команд = завышенная оценка.
-
-2. **Явно применяй корректировки.**
-   - Напиши: "BoneBET даёт X%, я корректирую до Y% потому что..."
-
-3. **В ответе обязательно укажи:**
-   - Исходный прогноз BoneBET
-   - Какие метрики ты скорректировал и почему
-   - Итоговый прогноз
+1. Каждая цифра должна оцениваться относительно оппозиции.
+2. Явно применяй корректировки: "BoneBET даёт X%, я корректирую до Y% потому что..."
+3. В ответе обязательно укажи исходный прогноз, корректировки и итоговый прогноз.
 
 ---
 
 ## ДАННЫЕ BONEBET
 
-### {t1_name} (Рейтинг HLTV: #{t1_rank})
-- True Win Rate: **{team1_win_rate*100:.1f}%** (вес: #1=1.0, #10=0.32, #50=0.14, #100+=0.1)
-- Firepower: **{t1_fp}**
-- Carry Index: **{t1_carry}** (>1.2 = зависимость от звезды)
+### {t1_name} (HLTV #{t1_rank})
+- True Win Rate: {team1_win_rate*100:.1f}%
+- Firepower: {t1_fp}
+- Carry Index: {t1_carry}
 
 Ключевые игроки:
 """
@@ -55,10 +47,10 @@ class PromptTemplates:
             prompt += f"- {p['nickname']}: Rating {p.get('official_rating', '—')}, K/D {p.get('official_kd', '—')}\n"
         
         prompt += f"""
-### {t2_name} (Рейтинг HLTV: #{t2_rank})
-- True Win Rate: **{team2_win_rate*100:.1f}%**
-- Firepower: **{t2_fp}**
-- Carry Index: **{t2_carry}**
+### {t2_name} (HLTV #{t2_rank})
+- True Win Rate: {team2_win_rate*100:.1f}%
+- Firepower: {t2_fp}
+- Carry Index: {t2_carry}
 
 Ключевые игроки:
 """
@@ -67,38 +59,35 @@ class PromptTemplates:
         
         prompt += f"""
 ## ПРОГНОЗ BONEBET (исходный)
-- {t1_name}: **{stats_prediction.get('team1_win_prob', 50):.1f}%**
-- {t2_name}: **{stats_prediction.get('team2_win_prob', 50):.1f}%**
-- Уверенность модели: {stats_prediction.get('confidence', 'unknown')}
+- {t1_name}: {stats_prediction.get('team1_win_prob', 50):.1f}%
+- {t2_name}: {stats_prediction.get('team2_win_prob', 50):.1f}%
 
 ---
 
 ## ТВОЙ АНАЛИЗ
 
-### 1. ОЦЕНКА СИЛЫ СОПЕРНИКОВ
-Для каждой команды определи:
-- Против кого набит True Win Rate? Топы или тир-3?
-- Качество Firepower — против сильных или слабых команд?
+1. Оцени силу соперников для каждой команды.
+2. Скорректируй метрики по правилам:
+   - True WR >70% против слабых → понизить на 15-25%
+   - True WR 50-60% против топ-20 → повысить на 10-20%
+   - Carry Index >1.3 + звезда не в форме → штраф 10-15%
+3. Сравни по линиям (AWPer, Entry, IGL).
+4. Выдай финальный вердикт.
 
-### 2. КОРРЕКТИРОВКА МЕТРИК
-Примени конкретные корректировки. Используй правила:
+Формат ответа:
+📊 BoneBET: {t1_name} {stats_prediction.get('team1_win_prob', 50):.1f}% / {t2_name} {stats_prediction.get('team2_win_prob', 50):.1f}%
 
-| Ситуация | Корректировка |
-|----------|---------------|
-| True WR >70% против слабых (#50+) | Понизить на 15-25% |
-| True WR 50-60% против топ-20 | Повысить на 10-20% |
-| Firepower >6.5 против тир-3 | Смотреть только на матчи против топ-30 |
-| Carry Index >1.3 + звезда не в форме | Штраф 10-15% |
-| IGL/Support с низким рейтингом | Не штрафовать команду |
+🔄 Корректировки: [что и почему]
 
-**Напиши: "Исходный прогноз BoneBET: X% на {t1_name}. Я корректирую до Y% потому что..."**
+✅ Итог: {t1_name} X% — Y% {t2_name}
+🎯 Победитель: [команда]
+📋 Ключевой фактор: [1 предложение]
 
-### 3. СРАВНЕНИЕ ПО ЛИНИЯМ
-- AWPer vs AWPer
-- Entry vs Entry  
-- IGL vs IGL
-
-### 4. ФИНАЛЬНЫЙ ВЕРДИКТ
-
-**Формат ответа (строго соблюдай):**
+Отвечай на русском. Без воды.
 """
+        return prompt
+    
+    @staticmethod
+    def system_prompt() -> str:
+        """Default system prompt for CS2 analyst."""
+        return """Ты — профессиональный CS2 аналитик. Оценивай каждую метрику в контексте оппозиции. Явно указывай корректировки исходного прогноза BoneBET. Отвечай строго по формату."""

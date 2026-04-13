@@ -18,11 +18,9 @@ class AIAnalyzer:
         if use_mock:
             self.client = MockLLMClient()
         else:
-            # Определяем провайдера из конфига
             provider_str = self.settings.AI_PROVIDER
-            provider = AIProvider(provider_str) if provider_str else AIProvider.OPENROUTER
+            provider = AIProvider(provider_str) if provider_str else AIProvider.OLLAMA
             
-            # Получаем API ключ в зависимости от провайдера
             api_key = None
             if provider == AIProvider.OPENROUTER:
                 api_key = self.settings.OPENROUTER_API_KEY
@@ -44,26 +42,15 @@ class AIAnalyzer:
         team2_data: Dict[str, Any],
         stats_prediction: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """
-        Run full AI analysis for a match.
+        """Run full AI analysis for a match."""
         
-        Returns:
-            {
-                "prompt": str,
-                "analysis": str,
-                "model": str,
-                "usage": dict,
-            }
-        """
-        
-        # Build prompt
         prompt = self.prompts.match_analysis(
             team1_data=team1_data,
             team2_data=team2_data,
             stats_prediction=stats_prediction,
         )
         
-        system_prompt = self.prompts.system_prompt()
+        system_prompt = PromptTemplates.system_prompt()
         
         logger.info(f"Running AI analysis for {team1_data.get('name')} vs {team2_data.get('name')}")
         
@@ -96,7 +83,6 @@ class AIAnalyzer:
         await self.client.close()
 
 
-# Синглтон для удобства
 _analyzer: Optional[AIAnalyzer] = None
 
 
