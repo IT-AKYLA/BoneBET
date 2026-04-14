@@ -1,0 +1,1 @@
+"""Scraper module for BO3.gg and HLTV."""

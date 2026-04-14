@@ -1,11 +1,15 @@
-"""Service for /bet endpoint - orchestrates match analysis with Redis cache."""
-
 import asyncio
 import json
 import re
 from typing import List, Dict, Any, Optional
 
-from app.clients.cs2_analytics import CS2AnalyticsClient
+from app.services.player_analysis_service import PlayerAnalysisService
+from app.services.scraper.bo3_client import BO3Client
+from app.services.scraper.match_scraper import MatchScraper
+from app.services.scraper.team_rankings_scraper import TeamRankingsScraper
+from app.services.scraper.team_scraper import TeamScraper
+from app.services.scraper.team_matches_scraper import TeamMatchesScraper
+from app.core.ai.prompts import PromptTemplates
 from app.core.ai import get_ai_analyzer
 from app.db.redis_client import RedisCache
 from app.utils.logger import get_logger
@@ -13,16 +17,24 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class BetService:
-    """Service for analyzing matches for betting with Redis cache."""
-    
+class BetService:    
     def __init__(self):
-        self.client = CS2AnalyticsClient()
+        self.player_service = PlayerAnalysisService()
         self.cache = RedisCache(prefix="bonebet")
-        self.cache_ttl = 300  
-        self.long_cache_ttl = 86400  
-        self.ai_request_delay = 3
+        self.cache_ttl = 300
+        self.llm_semaphore = asyncio.Semaphore(1)
+        self.ai_request_delay = 1
 
+        client = BO3Client(headless=True)
+        self.match_scraper = MatchScraper(client=client)
+        self.team_scraper = TeamScraper(client=client)
+        self.rankings_scraper = TeamRankingsScraper(client=client)
+        self.matches_scraper = TeamMatchesScraper(client=client)
+
+    # ========================================================================
+    # PUBLIC API
+    # ========================================================================
+    
     async def analyze_matches(
         self,
         limit: int = 10,
@@ -30,30 +42,239 @@ class BetService:
         use_ai: bool = True,
         force_refresh: bool = False,
     ) -> List[Dict[str, Any]]:
-        cache_key = f"matches:{tier_filter}:{limit}:{use_ai}"
+        """Analyze live and upcoming matches with full AI player pipeline."""
+        
+        cache_key = f"matches_v3:{tier_filter}:{limit}:{use_ai}"
         
         if not force_refresh:
-            cached = await self.cache.get(cache_key)
-            if cached:
-                try:
-                    data = json.loads(cached)
-                    logger.info(f"Returning cached data for {cache_key}")
-                    return data
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to decode cached data, refreshing...")
+            if cached := await self._get_cached(cache_key):
+                logger.info(f"Returning cached data for {cache_key}")
+                return cached
         
         logger.info(f"Cache miss for {cache_key}, fetching fresh data...")
-        results = await self._fetch_and_analyze(limit, tier_filter, use_ai)
+        
+        # Fetch rankings
+        rankings = await self._fetch_top_teams()
+        top_50_names = {t["name"] for t in rankings}
+        
+        # Fetch matches
+        matches = await self._fetch_all_matches()
+        logger.info(f"Fetched {len(matches)} total matches")
+        
+        # Filter tier1
+        if tier_filter == "tier1":
+            matches = [m for m in matches if self._is_tier1_match(m, top_50_names)]
+            logger.info(f"Filtered to {len(matches)} tier-1 matches")
+        
+        matches = matches[:limit]
+        
+        # Analyze sequentially to avoid overloading
+        results = []
+        for i, match in enumerate(matches, 1):
+            try:
+                logger.info(f"Analyzing match {i}/{len(matches)}")
+                analysis = await self._analyze_match_v2(match, use_ai, force_refresh)
+                if analysis:
+                    results.append(analysis)
+                if i < len(matches):
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Failed to analyze match {i}: {e}")
+                continue
         
         if results:
             await self.cache.set(cache_key, json.dumps(results), ttl=self.cache_ttl)
-            logger.info(f"Cached {len(results)} matches with key {cache_key}")
+            logger.info(f"Cached {len(results)} matches")
         
         return results
     
     async def invalidate_match_cache(self, tier_filter: str = "all") -> int:
-        """Invalidate match cache."""
-        patterns = [f"matches:{tier_filter}:*"]
+        patterns = [f"matches_v3:{tier_filter}:*"]
+        deleted = 0
+        for pattern in patterns:
+            deleted += await self.cache.delete_pattern(pattern)
+        return deleted
+    
+    # ========================================================================
+    # MATCH ANALYSIS
+    # ========================================================================
+    async def _fetch_all_matches_raw(self) -> List[Dict]:
+        """Fetch all matches without filtering."""
+        loop = asyncio.get_event_loop()
+        with self.match_scraper as scraper:
+            return await loop.run_in_executor(None, scraper.scrape_all_matches)
+    
+    async def _get_all_teams_cached(self) -> Dict[str, List[Dict]]:
+        """Кэширует результат парсинга всех команд."""
+        cache_key = "all_teams:top100"
+        if cached := await self._get_cached(cache_key):
+            return cached
+        
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, self.team_scraper.scrape_all_teams, 5)
+        
+        await self.cache.set(cache_key, json.dumps(data), ttl=86400)  # 24 часа
+        return data
+    
+    async def _get_team_win_rate_ai(self, team_name: str) -> float:
+        """Get team's approximate win rate from AI."""
+        cache_key = f"ai_win_rate:{team_name}"
+        if cached := await self.cache.get(cache_key):
+            try:
+                return float(cached)
+            except ValueError:
+                pass
+            
+        try:
+            ai = get_ai_analyzer(use_mock=False)
+            prompt = f"""Ты эксперт по CS2. Назови ПРИМЕРНЫЙ процент побед команды "{team_name}" за последние 3 месяца.
+    Ответ должен быть ТОЛЬКО числом от 0 до 100."""
+
+            result = await ai.client.complete(
+                prompt=prompt,
+                system_prompt="Отвечай только числом от 0 до 100.",
+                temperature=0.1,
+                max_tokens=10,
+            )
+            await ai.close()
+
+            import re
+            numbers = re.findall(r'\d+', result['text'])
+            wr = int(numbers[0]) / 100 if numbers else 0.5
+            wr = max(0.1, min(0.9, wr))
+
+            await self.cache.set(cache_key, str(wr), ttl=86400 * 7)
+            return wr
+
+        except Exception:
+            return 0.5
+    
+    
+    async def _analyze_match_v2(
+        self,
+        match: Dict[str, Any],
+        use_ai: bool,
+        force_refresh: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Analyze a single match."""
+        
+        t1_name = match.get('team1_name', 'Unknown')
+        t2_name = match.get('team2_name', 'Unknown')
+        
+        if t1_name == 'Unknown' or t2_name == 'Unknown' or t1_name == 'TBD' or t2_name == 'TBD':
+            return None
+        
+        logger.info(f"Analyzing: {t1_name} vs {t2_name}")
+        
+        # Get team data from scraper
+        t1_data = await self._get_team_data_cached(t1_name)
+        t2_data = await self._get_team_data_cached(t2_name)
+        
+        if not t1_data.get('players') or not t2_data.get('players'):
+            logger.warning(f"No players for {t1_name} vs {t2_name}")
+            return None
+        
+        # Win rates from scraper
+        wr1 = await self._calculate_team_win_rate(t1_name)
+        wr2 = await self._calculate_team_win_rate(t2_name)
+        
+        # Base prediction
+        prediction = self._calculate_prediction(t1_data, t2_data, wr1, wr2)
+        
+        # AI enhancement
+        ai_result = None
+        if use_ai:
+            ai_result = await self._run_ai_pipeline(t1_name, t2_name, wr1, wr2, force_refresh)
+            if ai_result and ai_result.get('winner'):
+                prediction = {
+                    'winner': ai_result['winner'],
+                    'team1_win_prob': ai_result.get('team1_prob', 50),
+                    'team2_win_prob': ai_result.get('team2_prob', 50),
+                    'confidence': ai_result.get('confidence', 'medium'),
+                }
+        
+        return {
+            "match_id": match.get('url', f"{t1_name}_vs_{t2_name}"),
+            "team1": t1_data,
+            "team2": t2_data,
+            "tournament": match.get('event'),
+            "scheduled_at": match.get('match_time'),
+            "status": match.get('status', 'upcoming'),
+            "prediction": prediction,
+            "ai_analysis": ai_result,
+        }
+    
+    async def _run_ai_pipeline(
+        self,
+        t1_name: str,
+        t2_name: str,
+        wr1: float,
+        wr2: float,
+        force_refresh: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Run AI: analyze players → compare teams."""
+        try:
+            t1_players = await self.player_service.analyze_team_players(t1_name, force_refresh)
+            t2_players = await self.player_service.analyze_team_players(t2_name, force_refresh)
+            
+            if not t1_players or not t2_players:
+                return None
+            
+            prompt = PromptTemplates.team_comparison(
+                team1_name=t1_name, team1_players=t1_players,
+                team2_name=t2_name, team2_players=t2_players,
+                team1_win_rate=wr1, team2_win_rate=wr2,
+            )
+            
+            async with self.llm_semaphore:
+                await asyncio.sleep(self.ai_request_delay)
+                
+                ai = get_ai_analyzer(use_mock=False)
+                result = await ai.client.complete(
+                    prompt=prompt,
+                    system_prompt="Ты — CS2 аналитик. Отвечай строго по формату.",
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+                await ai.close()
+            
+            return self._parse_ai_response(result['text'], t1_name, t2_name, t1_players, t2_players)
+            
+        except Exception as e:
+            logger.error(f"AI pipeline failed: {e}")
+            return None
+    
+    def _parse_ai_response(
+        self, text: str, t1_name: str, t2_name: str, t1_players: List, t2_players: List
+    ) -> Dict[str, Any]:
+        winner = t1_name if t1_name in text else t2_name if t2_name in text else t1_name
+        prob_match = re.search(r'(\d+)%', text)
+        prob = int(prob_match.group(1)) if prob_match else 50
+        
+        return {
+            'text': text,
+            'winner': winner,
+            'team1_prob': prob if winner == t1_name else 100 - prob,
+            'team2_prob': 100 - prob if winner == t1_name else prob,
+            'confidence': 'medium',
+            'players': {t1_name: t1_players, t2_name: t2_players},
+        }
+    
+    # ========================================================================
+    # DATA FETCHING (CACHED + SCRAPER)
+    # ========================================================================
+    
+    async def invalidate_all_cache(self) -> int:
+        """Сбросить ВЕСЬ кэш BoneBET."""
+        patterns = [
+            "matches_v3:*",           # Кэш матчей
+            "top_teams:*",            # Рейтинг команд
+            "team:*",                 # Составы команд
+            "bonebet:player:*",       # Анализ игроков
+            "true_win_rate:*",        # True Win Rate
+            "ai_ranking:*",           # AI рейтинг команд
+            "team_id:*",              # ID команд
+        ]
         deleted = 0
         for pattern in patterns:
             count = await self.cache.delete_pattern(pattern)
@@ -61,483 +282,128 @@ class BetService:
             logger.info(f"Deleted {count} keys for pattern {pattern}")
         return deleted
     
-    async def invalidate_cache(self, tier_filter: str = "all") -> None:
-        """Invalidate cache for specific tier filter."""
-        patterns = [f"matches:{tier_filter}:*"]
-        for pattern in patterns:
-            deleted = await self.cache.delete_pattern(pattern)
-            logger.info(f"Invalidated {deleted} cache entries for pattern {pattern}")
-
-    async def _get_team_ranking_ai(self, team_name: str) -> int:
-        """Get team ranking from AI. Always uses AI if not cached."""
-        cache_key = f"ai_ranking:{team_name}"
-
-        # Проверяем кэш
-        cached = await self.cache.get(cache_key)
-        if cached:
+    async def _get_cached(self, key: str) -> Optional[Any]:
+        if cached := await self.cache.get(key):
             try:
-                return int(cached)
-            except ValueError:
+                return json.loads(cached)
+            except json.JSONDecodeError:
                 pass
-            
-        # Кэша нет — идём в AI с задержкой
-        await asyncio.sleep(self.ai_request_delay)
+        return None
+    
+    async def _fetch_all_matches(self) -> List[Dict]:
+        """Fetch and filter matches to known teams only."""
+        matches = await self._fetch_all_matches_raw()
 
-        try:
-            ai_analyzer = get_ai_analyzer(use_mock=False)
+        # Получаем список известных команд из кэша
+        all_teams = await self._get_all_teams_cached()
+        known_teams = set(all_teams.keys())
 
-            prompt = f"""Ты эксперт по CS2. Назови ПРИМЕРНЫЙ текущий мировой рейтинг HLTV команды "{team_name}".
-    Ответ должен быть ТОЛЬКО числом от 1 до 200. Тир-3: 80-150. Неизвестные: 200."""
+        filtered = []
+        for m in matches:
+            t1 = m.get('team1_name', '')
+            t2 = m.get('team2_name', '')
+            if t1 in known_teams or t2 in known_teams:
+                filtered.append(m)
 
-            result = await ai_analyzer.client.complete(
-                prompt=prompt,
-                system_prompt="Отвечай только числом от 1 до 200.",
-                temperature=0.1,
-                max_tokens=10,
-            )
+        logger.info(f"Filtered to {len(filtered)} known matches (from {len(matches)} total)")
+        return filtered
 
-            await ai_analyzer.close()
-
-            text = result.get("text", "100")
-            numbers = re.findall(r'\d+', text)
-            ranking = int(numbers[0]) if numbers else 100
-            ranking = max(1, min(200, ranking))
-
-            # Кэшируем на 30 дней
-            await self.cache.set(cache_key, str(ranking), ttl=86400 * 30)
-            logger.info(f"AI ranking for {team_name}: #{ranking}")
-
-            return ranking
-
-        except Exception as e:
-            logger.warning(f"Failed to get AI ranking for {team_name}: {e}")
-            return 100  
-
-    async def _calculate_team_win_rate(
-        self,
-        team_name: str,
-        top_50_teams: Dict[int, int] = None
-    ) -> float:
-        """Calculate team's True Win Rate weighted by opponent strength."""
+    async def _fetch_top_teams(self) -> List[Dict]:
+        cache_key = "top_teams:50"
+        if cached := await self._get_cached(cache_key):
+            return cached
+        
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, self.rankings_scraper.scrape_rankings, 50)
+        
+        formatted = []
+        for rank, team in enumerate(data, 1):
+            formatted.append({
+                "id": hash(team['name']) % 10_000_000,
+                "name": team['name'],
+                "world_ranking": rank,
+            })
+        
+        await self.cache.set(cache_key, json.dumps(formatted), ttl=3600)
+        return formatted
+    
+    async def _get_team_data_cached(self, team_name: str) -> Dict:
+        key = f"team:{team_name}"
+        if cached := await self._get_cached(key):
+            return cached
+        
+        # Получаем ВСЕ команды из кэша (один запрос на 24 часа)
+        all_teams = await self._get_all_teams_cached()
+        players = all_teams.get(team_name, [])
+        
+        if not players:
+            logger.warning(f"Team {team_name} not found, using placeholder")
+            players = [{"nickname": f"{team_name}_player{i}"} for i in range(1, 6)]
+        
+        data = {
+            "id": hash(team_name) % 10_000_000,
+            "name": team_name,
+            "ranking": None,
+            "firepower": None,
+            "players": [{"nickname": p['nickname']} for p in players[:5]],
+        }
+        
+        await self.cache.set(key, json.dumps(data), ttl=86400)
+        return data
+    
+    async def _calculate_team_win_rate(self, team_name: str) -> float:
         if team_name == "Unknown":
             return 0.5
-        
-        cache_key = f"true_win_rate:{team_name}"
-        
-        cached = await self.cache.get(cache_key)
-        if cached:
+
+        key = f"true_win_rate:{team_name}"
+        if cached := await self.cache.get(key):
             try:
                 return float(cached)
             except ValueError:
                 pass
-        
-        try:
-            matches = await self.client.get_team_matches(team_name, limit=20)
-            if not matches:
-                return 0.5
             
-            total_weight = 0.0
-            weighted_wins = 0.0
-            
-            for match in matches:
-                team1 = match.get("team1", {})
-                team2 = match.get("team2", {})
-                team1_name_api = team1.get("name", "")
-                team2_name_api = team2.get("name", "")
-                score1 = match.get("team1_score", 0) or 0
-                score2 = match.get("team2_score", 0) or 0
-                
-                if team_name.lower() in team1_name_api.lower():
-                    is_win = score1 > score2
-                    opponent = team2
-                elif team_name.lower() in team2_name_api.lower():
-                    is_win = score2 > score1
-                    opponent = team1
-                else:
-                    continue
-                
-                opponent_id = opponent.get("id")
-                opponent_name = opponent.get("name", "")
-                
-                if top_50_teams and opponent_id and opponent_id in top_50_teams:
-                    opponent_rank = top_50_teams[opponent_id]
-                else:
-                    api_rank = opponent.get("world_ranking")
-                    if api_rank and api_rank > 0:
-                        opponent_rank = api_rank
-                    else:
-                        opponent_rank = await self._get_team_ranking_ai(opponent_name)  
-           
-                weight = 1.0 / (opponent_rank ** 0.5) if opponent_rank > 0 else 0.1
-                
-                total_weight += weight
-                if is_win:
-                    weighted_wins += weight
-            
-            true_win_rate = weighted_wins / total_weight if total_weight > 0 else 0.5
-            
-            await self.cache.set(cache_key, str(true_win_rate), ttl=21600)
-            logger.info(f"True Win Rate for {team_name}: {true_win_rate:.3f}")
-            return true_win_rate
-            
-        except Exception as e:
-            logger.warning(f"Failed to calculate true win rate for {team_name}: {e}")
-            return 0.5
-    
-    async def _fetch_and_analyze(
-        self,
-        limit: int,
-        tier_filter: str,
-        use_ai: bool,
-    ) -> List[Dict[str, Any]]:
-        """Fetch and analyze matches."""
-        
-        rankings = await self._fetch_top_teams()
-        top_50_ids = {t["id"] for t in rankings}
-        top_50_teams = {t["id"]: t["world_ranking"] for t in rankings}
-        
-        live_matches = await self._fetch_live_matches()
-        upcoming_matches = await self._fetch_upcoming_matches()
-        
-        all_matches = live_matches + upcoming_matches
-        logger.info(f"Fetched {len(live_matches)} live, {len(upcoming_matches)} upcoming matches")
-        
-        if tier_filter == "tier1":
-            all_matches = self._filter_tier1_matches(all_matches, top_50_ids)
-            logger.info(f"Filtered to {len(all_matches)} tier-1 matches")
-        
-        all_matches = all_matches[:limit]
-        
-        results = []
-        
-        ai_analyzer = None
-        if use_ai:
-            try:
-                ai_analyzer = get_ai_analyzer(use_mock=False)
-                logger.info("AI analyzer initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize AI analyzer: {e}")
-        
-        for match in all_matches:
-            try:
-                analysis = await self._analyze_single_match(
-                    match=match,
-                    top_50_teams=top_50_teams,
-                    ai_analyzer=ai_analyzer,
-                    use_ai=use_ai,
-                )
-                if analysis:
-                    results.append(analysis)
-            except Exception as e:
-                logger.error(f"Failed to analyze match: {e}")
-                continue
-        
-        if ai_analyzer:
-            await ai_analyzer.close()
-        
-        logger.info(f"Successfully analyzed {len(results)} matches")
-        return results
-    
-    async def _analyze_single_match(
-        self,
-        match: Dict[str, Any],
-        top_50_teams: Dict[int, int],
-        ai_analyzer: Optional[Any] = None,
-        use_ai: bool = True,
-    ) -> Optional[Dict[str, Any]]:
-        """Analyze a single match."""
-        
-        team1_name = self._extract_team_name(match, "team1")
-        team2_name = self._extract_team_name(match, "team2")
-        team1_id = self._extract_team_id(match, "team1")
-        team2_id = self._extract_team_id(match, "team2")
-        
-        # Получаем названия по ID если Unknown
-        if team1_name == "Unknown" and team1_id:
-            team1_data = await self._get_team_data_safe(team1_id, str(team1_id))
-            team1_name = team1_data.get("name", "Unknown")
-        
-        if team2_name == "Unknown" and team2_id:
-            team2_data = await self._get_team_data_safe(team2_id, str(team2_id))
-            team2_name = team2_data.get("name", "Unknown")
-        
-        if team1_name == "Unknown" or team2_name == "Unknown":
-            logger.warning(f"Skipping match: {team1_name} vs {team2_name}")
-            return None
-        
-        logger.info(f"Analyzing: {team1_name} vs {team2_name}")
-        
-        team1_data = await self._get_team_data_cached(team1_id, team1_name)
-        team2_data = await self._get_team_data_cached(team2_id, team2_name)
-        
-        team1_win_rate = await self._calculate_team_win_rate(team1_name, top_50_teams)
-        team2_win_rate = await self._calculate_team_win_rate(team2_name, top_50_teams)
-        
-        prediction = self._calculate_prediction(
-            team1_data, team2_data, team1_win_rate, team2_win_rate
-        )
-        
-        ai_result = None
-        if ai_analyzer and use_ai:
-            ai_result = await self._run_ai_analysis_safe(
-                ai_analyzer, team1_data, team2_data, prediction
-            )
-        
-        return {
-            "match_id": self._generate_match_id(match, team1_name, team2_name),
-            "team1": team1_data,
-            "team2": team2_data,
-            "tournament": self._extract_tournament(match),
-            "scheduled_at": self._extract_scheduled_time(match),
-            "status": match.get("status", "upcoming"),
-            "prediction": prediction,
-            "ai_analysis": ai_result,
-        }
-    
-    async def _run_ai_analysis_safe(
-        self,
-        ai_analyzer: Any,
-        team1_data: Dict,
-        team2_data: Dict,
-        prediction: Dict,
-    ) -> Optional[Dict]:
-        """Safely run AI analysis with rate limiting."""
-        await asyncio.sleep(self.ai_request_delay)
-        
-        try:
-            result = await ai_analyzer.analyze_match(
-                team1_data=team1_data,
-                team2_data=team2_data,
-                stats_prediction=prediction,
-            )
-            
-            return {
-                "text": result.get("analysis"),
-                "model": result.get("model"),
-                "provider": result.get("provider"),
-            }
-        except Exception as e:
-            logger.error(f"AI analysis failed: {e}")
-            return None
-    
-    async def _fetch_top_teams(self) -> List[Dict]:
-        cache_key = "top_teams:50"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            try:
-                return json.loads(cached)
-            except json.JSONDecodeError:
-                pass
-        
-        try:
-            data = await self.client.get_team_rankings(limit=50)
-            await self.cache.set(cache_key, json.dumps(data), ttl=3600)
-            return data
-        except Exception as e:
-            logger.error(f"Failed to fetch top teams: {e}")
-            return []
-    
-    async def _fetch_live_matches(self) -> List[Dict]:
-        cache_key = "matches:live"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            try:
-                return json.loads(cached)
-            except json.JSONDecodeError:
-                pass
-        
-        try:
-            data = await self.client.get_live_matches()
-            await self.cache.set(cache_key, json.dumps(data), ttl=60)
-            return data
-        except Exception as e:
-            logger.error(f"Failed to fetch live matches: {e}")
-            return []
-    
-    async def _fetch_upcoming_matches(self) -> List[Dict]:
-        cache_key = "matches:upcoming"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            try:
-                return json.loads(cached)
-            except json.JSONDecodeError:
-                pass
-        
-        try:
-            data = await self.client.get_upcoming_matches()
-            await self.cache.set(cache_key, json.dumps(data), ttl=300)  
-            return data
-        except Exception as e:
-            logger.error(f"Failed to fetch upcoming matches: {e}")
-            return []
+        # Пробуем спарсить
+        loop = asyncio.get_event_loop()
+        matches = await loop.run_in_executor(None, self.matches_scraper.scrape_team_matches, team_name, False)
 
-    async def _get_team_data_cached(self, team_id: Optional[int], team_name: str) -> Dict[str, Any]:
-        cache_key = f"team:{team_id or team_name}"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            try:
-                return json.loads(cached)
-            except json.JSONDecodeError:
-                pass
-        
-        data = await self._get_team_data_safe(team_id, team_name)
-        if data.get("id") != 0:
-            await self.cache.set(cache_key, json.dumps(data), ttl=self.long_cache_ttl)
-        return data
+        if matches:
+            wins = sum(1 for m in matches if m.get('winner') == team_name)
+            total = len(matches)
+            wr = wins / total if total > 0 else 0.5
+        else:
+            # Fallback: запрашиваем у AI
+            logger.warning(f"No matches for {team_name}, asking AI...")
+            wr = await self._get_team_win_rate_ai(team_name)
+
+        await self.cache.set(key, str(wr), ttl=21600)
+        return wr
     
-    async def _get_team_data_safe(self, team_id: Optional[int], team_name: str) -> Dict[str, Any]:
-        if not team_id:
-            team_id = await self._find_team_id_by_name(team_name)
+    def _calculate_prediction(self, t1: Dict, t2: Dict, wr1: float, wr2: float) -> Dict[str, Any]:
+        fp1 = t1.get("firepower") or 5.0
+        fp2 = t2.get("firepower") or 5.0
         
-        team = None
-        if team_id:
-            try:
-                team = await self.client.get_team(team_id, wait_for_loading=True)
-            except Exception as e:
-                logger.warning(f"Failed to get team {team_name}: {e}")
-        
-        players = await self._get_players_stats_safe(team, team_name)
-        ratings = [p.get("official_rating", 0) for p in players if p.get("official_rating")]
-        firepower = sum(ratings) / len(ratings) if ratings else None
-        
-        return {
-            "id": team_id or 0,
-            "name": team.get("name", team_name) if team else team_name,
-            "ranking": team.get("world_ranking") if team else None,
-            "firepower": round(firepower, 2) if firepower else None,
-            "players": players[:5],
-        }
-    
-    async def _find_team_id_by_name(self, name: str) -> Optional[int]:
-        cache_key = f"team_id:{name}"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            return int(cached)
-        
-        try:
-            teams = await self.client.search_teams(name)
-            if teams:
-                team_id = teams[0].get("id")
-                if team_id:
-                    await self.cache.set(cache_key, str(team_id), ttl=self.long_cache_ttl)                    
-                    return team_id
-        except Exception:
-            pass
-        return None
-    
-    async def _get_players_stats_safe(self, team: Optional[Dict], team_name: str) -> List[Dict]:
-        players = []
-        players_data = team.get("players", []) if team else []
-        unique_nicks = set(p.get("nickname") for p in players_data if p.get("nickname"))
-        
-        if not unique_nicks:
-            logger.warning(f"No players found for {team_name}")
-            return []
-        
-        for nickname in list(unique_nicks)[:5]:
-            player_data = await self._get_player_cached(nickname)
-            players.append(player_data)
-        
-        return players
-    
-    async def _get_player_cached(self, nickname: str) -> Dict:
-        cache_key = f"player:{nickname}"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            try:
-                return json.loads(cached)
-            except json.JSONDecodeError:
-                pass
-        
-        try:
-            player = await self.client.get_player(nickname, wait_for_loading=False)
-            official = player.get("official_stats", {})
-            faceit = player.get("faceit_stats", {})
-            
-            data = {
-                "nickname": nickname,
-                "official_rating": official.get("avg_rating"),
-                "official_kd": official.get("avg_kd"),
-                "official_adr": official.get("avg_adr"),
-                "faceit_elo": faceit.get("elo") if faceit else None,
-            }
-            
-            await self.cache.set(cache_key, json.dumps(data), ttl=self.long_cache_ttl)
-            return data
-        except Exception as e:
-            logger.warning(f"Failed to get player {nickname}: {e}")
-            return {"nickname": nickname}
-        
-    def _calculate_prediction(
-        self,
-        team1_data: Dict,
-        team2_data: Dict,
-        team1_win_rate: float = 0.5,
-        team2_win_rate: float = 0.5,
-    ) -> Dict[str, Any]:
-        fp1 = team1_data.get("firepower") or 5.0
-        fp2 = team2_data.get("firepower") or 5.0
-        
-        wr_score1 = team1_win_rate * 100
-        wr_score2 = team2_win_rate * 100
-        
-        fp_score1 = fp1 * 12
-        fp_score2 = fp2 * 12
-        
-        score1 = wr_score1 * 0.7 + fp_score1 * 0.3
-        score2 = wr_score2 * 0.7 + fp_score2 * 0.3
+        score1 = wr1 * 70 + fp1 * 3.6
+        score2 = wr2 * 70 + fp2 * 3.6
         
         total = score1 + score2
         prob1 = (score1 / total) * 100 if total > 0 else 50
         prob2 = 100 - prob1
         
         diff = abs(prob1 - 50)
-        if diff > 15:
-            confidence = "high"
-        elif diff > 7:
-            confidence = "medium"
-        else:
-            confidence = "low"
-        
-        winner = team1_data["name"] if prob1 > prob2 else team2_data["name"]
+        conf = "high" if diff > 15 else "medium" if diff > 7 else "low"
         
         return {
-            "winner": winner,
+            "winner": t1["name"] if prob1 > prob2 else t2["name"],
             "team1_win_prob": round(prob1, 1),
             "team2_win_prob": round(prob2, 1),
-            "confidence": confidence,
+            "confidence": conf,
         }
     
-    def _filter_tier1_matches(self, matches: List[Dict], top_50_ids: set) -> List[Dict]:
-        filtered = []
-        for m in matches:
-            team1_id = self._extract_team_id(m, "team1")
-            team2_id = self._extract_team_id(m, "team2")
-            if team1_id in top_50_ids and team2_id in top_50_ids:
-                filtered.append(m)
-        return filtered
+    # ========================================================================
+    # HELPERS
+    # ========================================================================
     
-    def _extract_team_name(self, match: Dict, prefix: str) -> Optional[str]:
-        name = match.get(f"{prefix}_name")
-        if not name:
-            team_obj = match.get(prefix, {})
-            if isinstance(team_obj, dict):
-                name = team_obj.get("name")
-        return name or "Unknown"
-    
-    def _extract_team_id(self, match: Dict, prefix: str) -> Optional[int]:
-        team_id = match.get(f"{prefix}_id")
-        if team_id is None:
-            team_obj = match.get(prefix, {})
-            if isinstance(team_obj, dict):
-                team_id = team_obj.get("id")
-        return team_id
-    
-    def _extract_tournament(self, match: Dict) -> Optional[str]:
-        return match.get("event") or match.get("tournament_name")
-    
-    def _extract_scheduled_time(self, match: Dict) -> Optional[str]:
-        return match.get("match_time") or match.get("scheduled_at")
-    
-    def _generate_match_id(self, match: Dict, team1: str, team2: str) -> str:
-        return str(match.get("id") or match.get("url", f"{team1}_vs_{team2}"))
+    def _is_tier1_match(self, match: Dict, top_50_names: set) -> bool:
+        t1 = match.get('team1_name', '')
+        t2 = match.get('team2_name', '')
+        return t1 in top_50_names and t2 in top_50_names

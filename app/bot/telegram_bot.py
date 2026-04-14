@@ -31,19 +31,22 @@ class BoneBETBot:
             "Прогнозы на CS2 матчи с AI анализом\n\n"
             "*/bet* — все матчи\n"
             "*/live* — только LIVE\n"
-            "*/refresh* — сбросить кэш\n"
+            "*/refresh* — сбросить ВЕСЬ кэш\n"
             "*/bet 5* — топ-5\n"
             "*/bet tier1* — элитный уровень"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     
     async def refresh_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сбросить кэш и получить свежий анализ."""
-        msg = await update.message.reply_text("🔄 Сбрасываю кэш...")
-        
+        """Сбросить ВЕСЬ кэш и получить свежий анализ."""
+        msg = await update.message.reply_text("🔄 Сбрасываю весь кэш...")
+
         try:
-            deleted = await self.bet_service.invalidate_match_cache()
-            await msg.edit_text(f"✅ Кэш сброшен ({deleted} ключей)\nИспользуй /bet для свежего анализа")
+            deleted = await self.bet_service.invalidate_all_cache()
+            await msg.edit_text(
+                f"✅ Кэш полностью сброшен ({deleted} ключей)\n"
+                f"Используй /bet для свежего анализа"
+            )
         except Exception as e:
             logger.error(f"Refresh error: {e}")
             await msg.edit_text("❌ Ошибка сброса кэша")
